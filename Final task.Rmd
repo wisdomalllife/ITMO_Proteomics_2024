@@ -1,0 +1,309 @@
+---
+title: "Final task"
+author: "Victoria"
+date: "2024-04-18"
+output: html_document
+---
+
+# Libraries
+
+```{r}
+library(impute)
+library(limma)
+library(ggplot2)
+library(vegan)
+library(dplyr)
+library(tidyverse)
+library(readxl)
+library(ape)
+library(clusterProfiler)
+library(dendextend)
+library(RColorBrewer)
+library(Biobase)
+library(gplots)
+library(ggrepel)
+library(gprofiler2)
+library(dendextend)
+library(NMF)
+library(DT)
+```
+
+# Data
+
+```{r}
+data <- read.csv("peaks_data.csv")
+```
+
+## data preprocessing and normalization
+
+# remove missing values
+```{r}
+sum(is.na(data))
+data <- data[which(rowMeans(!is.na(data)) > 0.5), ]
+data <- data[which(!duplicated(data$Gene_id)),]
+rownames(data) <- data$Gene_id
+sum(is.na(data))
+data <- data[, -c(1:3)]
+```
+# imputation of missed data with KNN
+```{r}
+data_m <- as.matrix(data)
+data_m <- t(data_m)
+knn_d <- impute.knn(data_m, k = 5)
+data_m <- knn_d$data
+data_m <- as.data.frame(data_m)
+data_m <- t(as.matrix(data_m))
+head(data_m, 3)
+```
+
+# normalizing
+```{r}
+boxplot(data_m, col = c(rep("blue", 14), rep("red", 19)), main = "data")
+legend("bottomright", legend = c("BT", "CJK"), fill = c("blue", "red"))
+```
+
+```{r}
+data_norm <- log2(data_m + 1)
+data_norm <- normalizeQuantiles(as.matrix(data_norm))
+```
+
+```{r}
+boxplot(data_norm, col = c(rep("blue", 14), rep("red", 19)), main = "Normalized data")
+legend("bottomright", legend = c("BT", "CJK"), fill = c("blue", "red"))
+```
+
+## Evaluate the presence of a batch-effect using PCA
+
+```{r}
+d_pca <- t(data_norm)
+rda_pca <- rda(d_pca, scale = TRUE)
+
+rownames(d_pca) <- colnames(data_m)
+```
+
+```{r}
+d_scores <- data.frame(
+    d_pca,
+    scores(rda_pca, display = "sites", choices = c(1, 2, 3), scaling = "sites")
+)
+
+p_scores <- ggplot(d_scores, aes(x = PC1, y = PC2)) +
+    geom_point(aes(color = rownames(d_pca)), alpha = 0.5) +
+    coord_equal(xlim = c(-3, 3), ylim = c(-3, 3)) +
+    ggtitle(label = "Ordination") +
+    theme_bw()
+p_scores
+```
+# MA-plot
+```{r}
+maplot <- function(X1, X2, pch = 21, main = "MA-plot", xlab = "Average log-expression", ylab = "Expression log-ratio", lpars = list(col = "blue", lwd = 2), ...) {
+  X <- (rowMeans(X2) + rowMeans(X1)) / 2
+  Y <- rowMeans(X2) - rowMeans(X1)
+  scatter.smooth(x = X, y = Y, main = main, pch = pch, xlab = xlab, ylab = ylab, lpars = lpars, ...)
+  abline(h = c(-1, 0, 1), lty = c(2, 1, 2))
+}
+```
+
+```{r}
+maplot(data_norm[, 1:14], data_norm[, 14:32])
+```
+## Identify differentially expressed proteins
+
+```{r}
+expr_data <- as.matrix(data_norm)
+
+experiment <- as.factor(sapply(strsplit(colnames(data_m), "_"), `[`, 1))
+pheno_data <- data.frame(experiment)
+rownames(pheno_data) <- colnames(data_m)
+pheno_metadata <- data.frame(
+    labelDescription = c("Experimental condition"),
+    row.names = c("Condition")
+)
+pheno_data <- new("AnnotatedDataFrame",
+    data = pheno_data,
+    varMetadata = pheno_metadata
+)
+
+feature_data <- data.frame(Prot = rownames(expr_data))
+rownames(feature_data) <- rownames(expr_data)
+feature_metadata <- data.frame(
+    labelDescription = c("Protain name"),
+    row.names = c("Protain")
+)
+f_data <- new("AnnotatedDataFrame",
+    data = feature_data,
+    varMetadata = feature_metadata
+)
+
+exp_set <-
+    ExpressionSet(
+        assayData = expr_data,
+        phenoData = pheno_data,
+        featureData = f_data
+    )
+```
+
+```{r}
+X <- model.matrix(~experiment, pData(exp_set))
+fit <- lmFit(exp_set, design = X, method = "robust", maxit = 1000)
+efit <- eBayes(fit)
+```
+```{r}
+MA_limma <- function(efit, coef, n = 10, signif = TRUE, fdr = 0.05, lfc = 0, text = TRUE, cex.text = 0.8, col.text = "grey20", main = "MA-plot", xlab = "Average log-expression", ylab = "Expression log-ratio", pch = 19, pch.signif = 21, col = "darkgreen", alpha = 0.3, cex = 0.3, ...){
+  
+  R <- efit$coefficients[, coef]
+  I <- efit$Amean
+  
+  col_btransp <- adjustcolor(col, alpha.f = alpha)
+  
+  plot(I, R, cex = cex, main = main, pch = pch, xlab = xlab, ylab = ylab, col = col_btransp, ...)
+  abline(h = 0)
+  
+  if(signif){
+    sign <- p.adjust(efit$p.value[, coef], method = "BH") <= fdr
+    large <- abs(efit$coefficients[, coef]) >= lfc
+    points(I[sign & large], R[sign & large], cex = cex*2, col = "orange2", pch = pch.signif)
+  }
+  
+  if(text){
+    ord <- order(efit$lods[, coef], decreasing = TRUE)
+    top_n <- ord[1:n]
+    text(I[top_n], R[top_n], labels = efit$genes[top_n, ], pos = 4, cex = cex.text, col = col.text)
+  }
+}
+
+
+MA_limma(efit, coef = 2, n = 30)
+```
+```{r}
+my_list <- topTable(efit, coef = 2, n = 100)
+dif_exp_set <- exp_set[fData(exp_set)$Prot %in% my_list$Prot, ]
+```
+
+```{r}
+dat <- as.matrix(exprs(dif_exp_set))
+pal_blue_red <- colorpanel(75, low = "steelblue", mid = "black", high = "red")
+heatmap.2(dat, col = pal_blue_red, scale = "row", key = TRUE, symkey = FALSE, density.info = "none", trace = "none", cexRow = 0.9, cexCol = 1, margins = c(4, 3), keysize = 0.8, key.par = list(mar = c(3, 0.1, 3, 0.1)))
+
+```
+
+```{r}
+topTable(efit, coef = 2)
+numGenes <- nrow(exprs(exp_set))
+full_list <- topTable(efit, number = numGenes)
+full_list <- full_list[full_list$adj.P.Val <= 0.05, ]
+#write.csv(full_list, "DE_full.csv")
+```
+
+```{r}
+MA_limma(efit, coef = 2, n = 80, text = F, lfc = 1)
+```
+
+```{r}
+my_list <- full_list
+dif_exp_set <- exp_set[fData(exp_set)$Prot %in% my_list$Prot, ]
+```
+# vulcano plot
+```{r }
+volcano_list <- full_list
+
+volcano1 <- ggplot(data = volcano_list, aes(x = logFC, y = -log10(adj.P.Val))) + geom_point()
+
+volcano2 <- volcano1 + geom_vline(xintercept=c(-0.6, 0.6), col="red") +
+  geom_hline(yintercept=-log10(0.05), col="red")
+
+volcano_list$diffexpressed <- "NO"       
+```
+```{r }
+volcano_list$diffexpressed[volcano_list$logFC > 1 & volcano_list$adj.P.Val < 0.05] <- "UP"
+volcano_list$diffexpressed[volcano_list$logFC < -1 & volcano_list$adj.P.Val< 0.05] <- "DOWN"
+
+volcanodif1 <- ggplot(data = volcano_list, aes(x = logFC, y = -log10(adj.P.Val), col = diffexpressed)) +
+    geom_point() +
+    theme_minimal() +
+    geom_text_repel(data = head(volcano_list, 20), aes(label = head(volcano_list, 20)$Prot))
+volcanodif1
+```
+```{r}
+diff_prot <- rownames(full_list)
+diff_expressed <- as.data.frame(data_norm)[diff_prot, ]
+t_diff_expressed <- t(diff_expressed)
+# rownames(t_diff_expressed) <-  as.factor(gsub("_[^_]*", replacement = "", rownames(t_diff_expressed)))
+# rownames(t_diff_expressed) <- make.unique(as.character(pheno$df_experiment))
+
+d <- dist(x = t_diff_expressed, method = "canberra")
+
+mouse_hc_avg <- hclust(d, method = "average")
+mouse_ph_avg <- as.phylo(mouse_hc_avg)
+mouse_den_avg <- as.dendrogram(mouse_hc_avg)
+
+get_colours <- function(dend, n_chars, palette = "Dark2") { 
+    labs <- get_leaves_attr(dend, "label")
+    group <- substr(labs, start = 0, stop = n_chars)
+    group <- factor(group)
+    cols <- brewer.pal(length(levels(group)), name = palette)[group]
+    return(cols)
+}
+
+cols <- get_colours(dend = mouse_den_avg, n_chars = 6)
+den_avg_c <- color_labels(dend = mouse_den_avg, col = cols)
+plot(den_avg_c, horiz = TRUE)
+```
+
+# enrichment analysis
+```{r}
+# keep only the significant proteins results
+sig <- subset(full_list, adj.P.Val < 0.05)
+# get the significant up-regulated proteins
+up <- subset(sig, logFC > 0)
+# get the significant down-regulated proteins
+down <- subset(sig, logFC < 0)
+# needed to convert to enrichResult object
+up_names <- gconvert(row.names(up))
+down_names <- gconvert(row.names(down))
+```
+```{r}
+multi_gp_up_reg <- gost(list("up-regulated" = up_names$name), multi_query = FALSE, evcodes =TRUE)
+gp_mod_up = multi_gp_up_reg$result[, c("query", "source", "term_id","term_name", "p_value", "query_size", "intersection_size", "term_size", "effective_domain_size", "intersection")]
+gp_mod_up <- gp_mod_up[order(gp_mod_up$p_value), ]
+gp_mod_up_BP <- gp_mod_up[gp_mod_up$source == "GO:BP", ]
+gp_mod_up_BP$GeneRatio <- paste0(gp_mod_up_BP$intersection_size,  "/", gp_mod_up_BP$query_size)
+gp_mod_up_BP$BgRatio <- paste0(gp_mod_up_BP$term_size, "/", gp_mod_up_BP$effective_domain_size)
+names(gp_mod_up_BP) <- c("Cluster", "Category", "ID", "Description", "p.adjust", "query_size", "Count", "term_size", "effective_domain_size", "geneID", "GeneRatio", "BgRatio")
+gp_mod_up_BP$geneID <- gsub(",", "/", gp_mod_up_BP$geneID)
+row.names(gp_mod_up_BP) <- gp_mod_up_BP$ID
+gp_mod_enrich_up_BP <- new("enrichResult", result = gp_mod_up_BP)
+
+```
+Draw enrichment plot:
+```{r warning=FALSE, message=FALSE}
+enrichplot::dotplot(gp_mod_enrich_up_BP, showCategory = 10) + ggplot2::labs(title = "up-regulated") + ggplot2::scale_color_gradient(low = "lightseagreen", high = "darkorange1")
+```
+
+## Down-regulated proteins
+
+```{r warning=FALSE, message=FALSE}
+multi_gp_down_reg <- gost(list("down-regulated" = down_names$name), multi_query = FALSE, evcodes =TRUE)
+
+gp_mod_down = multi_gp_down_reg$result[, c("query", "source", "term_id","term_name", "p_value", "query_size", "intersection_size", "term_size", "effective_domain_size", "intersection")]
+gp_mod_down <- gp_mod_down[order(gp_mod_down$p_value), ]
+
+gp_mod_down_BP <- gp_mod_down[gp_mod_down$source == "GO:BP", ]
+gp_mod_down_BP$GeneRatio <- paste0(gp_mod_down_BP$intersection_size,  "/", gp_mod_down_BP$query_size)
+gp_mod_down_BP$BgRatio <-  paste0(gp_mod_down_BP$term_size, "/", gp_mod_down_BP$effective_domain_size)
+names(gp_mod_down_BP) <- c("Cluster", "Category", "ID", "Description", "p.adjust", "query_size", "Count", "term_size", "effective_domain_size", "geneID", "GeneRatio", "BgRatio")
+gp_mod_down_BP$geneID <- gsub(",", "/", gp_mod_down_BP$geneID)
+gp_mod_enrich_down_BP <- new("enrichResult", result = gp_mod_down_BP)
+```
+
+Draw enrichment plot:
+
+```{r warning=FALSE, message=FALSE}
+enrichplot::dotplot(gp_mod_enrich_down_BP, showCategory = 10) + ggplot2::labs(title = "down-regulated") + ggplot2::scale_color_gradient(low = "lightseagreen", high = "darkorange1")
+```
+
+## biological explanation
+Both up- and down-regulated processes exhibit similarities in terms of localization, cellular localization, and the establishment of localization.
+"organelle localization", "intracellular protein transport" are down-regulated. They may be disrupted in these cells.
+"fatty acid oxidation", "fatty acid beta-oxidation", "fatty acid catabolic processes", and "lipid oxidation"  are up-regulated in CJK cells.The increase in these processes may indicate oxidative stress, which has the potential to stimulate inflammation and calcification pathways.
+
